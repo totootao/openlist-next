@@ -1,4 +1,5 @@
 import { resolvePath, getDb, saveDb } from "../model/db"
+import { isSealedValue } from "../../pkg/crypto"
 import { FileItem, StorageDriver, calcFileType } from "../driver/base"
 import { Onedrive } from "../../drivers/onedrive/driver"
 import { OnedriveAPP } from "../../drivers/onedrive_app/driver"
@@ -154,9 +155,21 @@ export async function getOrCreateDriver(
 function parseAddition(storageConfig?: any): any {
   const additionStr = storageConfig?.addition
   if (!additionStr) return {}
-  return typeof additionStr === "string"
-    ? JSON.parse(additionStr || "{}")
-    : additionStr
+  if (typeof additionStr !== "string") return additionStr
+
+  // 密文流到这里，说明 load 阶段的 unseal 没生效。此时若交给 JSON.parse，
+  // 报错会是 `Unexpected token 'e', "enc:v1:..." is not valid JSON` ——
+  // 指向 JSON 解析，而真实原因是密钥不一致，排查方向会被完全带偏。
+  if (isSealedValue(additionStr)) {
+    throw new Error(
+      "[storage] 存储配置的 addition 仍是加密状态（enc:v1:），未能解密。" +
+        "通常是 JWT_SECRET 与写入该配置时不一致，或持久化密钥 " +
+        "openlist_encryption_secret 丢失 / 被轮换。" +
+        "请恢复原来的 JWT_SECRET 后重试；在此期间不要保存配置，否则密文会被原样留存。",
+    )
+  }
+
+  return JSON.parse(additionStr || "{}")
 }
 
 async function createDriver(

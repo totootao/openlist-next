@@ -1,4 +1,9 @@
-import { encrypt, decrypt } from "../../pkg/crypto"
+import {
+  encrypt,
+  decrypt,
+  ENCRYPTION_PREFIX,
+  isSealedValue,
+} from "../../pkg/crypto"
 import {
   generateSecret,
   readPersistedSecret,
@@ -1034,6 +1039,72 @@ const DB_CACHE_TTL_MS = 1000
 const dbCache = new WeakMap<object, { ts: number; db: any }>()
 const dbInflight = new WeakMap<object, Promise<any>>()
 
+/**
+ * 取不到加密密钥时重试若干次。
+ *
+ * 场景：本实例是冷启动、缓存为空，而密钥由另一个实例刚写入持久化存储。
+ * Cloudflare KV / EdgeOne KV 等最终一致存储存在传播延迟，`getEncryptionKey`
+ * 会短暂返回 null。此时若直接放弃解密，密文就会原样交给驱动。
+ *
+ * `getEncryptionKey` 在未取到值时不会写入缓存，所以重试是真实重读。
+ */
+async function retryEncryptionKey(
+  envCtx: any,
+  attempts = 3,
+  baseMs = 120,
+): Promise<string | null> {
+  for (let i = 0; i < attempts; i++) {
+    await sleep(baseMs * Math.pow(2, i))
+    const key = await getEncryptionKey(envCtx)
+    if (key) {
+      console.warn(
+        `[DB] Encryption key became available after ${i + 1} retr${
+          i === 0 ? "y" : "ies"
+        } (eventual-consistency lag).`,
+      )
+      return key
+    }
+  }
+  return null
+}
+
+/**
+ * 解密持久化配置，并保证「绝不把解不开的密文悄悄交出去」。
+ *
+ * 为什么这层必须存在：一旦 `enc:v1:` 密文流入驱动，就会以
+ * `Unexpected token 'e', "enc:v1:..." is not valid JSON` 的形式崩在
+ * `parseAddition` 里——报错指向 JSON 解析，真实原因却是密钥不一致，
+ * 排查方向完全被带偏。
+ */
+async function unsealPersisted(data: any, envCtx: any): Promise<void> {
+  let key = await getEncryptionKey(envCtx)
+
+  // 数据里有密文却拿不到密钥 → 先重试，不要放弃解密。
+  if (!key && hasSealedValues(data)) {
+    key = await retryEncryptionKey(envCtx)
+  }
+
+  sealedButUndecryptable = 0
+  await unsealDb(data, key)
+
+  // 解密后自检：仍有残留 = 密钥与加密时不一致（JWT_SECRET 改动 / 持久化
+  // 密钥丢失或轮换）。此时不丢数据，但必须 loudly 报错，让故障可定位。
+  if (hasSealedValues(data)) {
+    const suffix = sealedButUndecryptable
+      ? ` (${sealedButUndecryptable} value(s) failed to decrypt)`
+      : " (no encryption key available)"
+    console.error(
+      "[DB] Config still contains encrypted values after unseal" +
+        suffix +
+        ". The encryption key does not match the one used when this config " +
+        "was written — storage drivers will fail to read their credentials. " +
+        "Restore the original JWT_SECRET (or the persisted key " +
+        "openlist_encryption_secret); do NOT re-save config, which would " +
+        "keep the ciphertext and lock it in.",
+    )
+  }
+}
+
 const loadDb = async (envCtx?: any) => {
   if (envCtx) {
     globalEnvCtx = envCtx
@@ -1048,7 +1119,7 @@ const loadDb = async (envCtx?: any) => {
   try {
     const persisted = await backend.load(activeEnv)
     if (persisted) {
-      await unsealDb(persisted, await getEncryptionKey(activeEnv))
+      await unsealPersisted(persisted, activeEnv)
       memoryDb = persisted
       dbLastLoadError = null
       ensureDefaultSettings(memoryDb)
@@ -1129,8 +1200,11 @@ export const getDb = async (envCtx?: any) => {
 // 改动。密钥统一取 JWT_SECRET（签名与加密共用）；未配置时跳过加密，
 // 保持既有部署（无密钥）向后兼容。已存在的明文数据不带前缀，unseal 时原样
 // 返回，不会因升级而丢失。
+//
+// 前缀常量 `ENCRYPTION_PREFIX` 定义在 pkg/crypto.ts（依赖图最底层），
+// 便于驱动侧解析器（op/storage.ts 的 parseAddition）判定「这还是密文」，
+// 从而给出可读报错而不是 `enc:v1:... is not valid JSON`。
 // ============================================================
-const ENCRYPTION_PREFIX = "enc:v1:"
 
 const SENSITIVE_SETTING_KEYS = new Set([
   "token",
@@ -1392,13 +1466,29 @@ async function sealValue(value: string, key: string): Promise<string> {
   return ENCRYPTION_PREFIX + (await encrypt(value, key))
 }
 
+/**
+ * 解密失败计数（单次 load 内累计）。
+ *
+ * 用途：让上层能区分「本就没加密」与「加密了但解不开」。后者必须被看见——
+ * 密文一旦流到驱动侧，就会以 `enc:v1:... is not valid JSON` 的形式崩在
+ * 完全无关的地方，运维根本无从判断是密钥问题。
+ */
+let sealedButUndecryptable = 0
+
 async function unsealValue(value: string, key: string): Promise<string> {
   if (!value || !value.startsWith(ENCRYPTION_PREFIX)) return value
   try {
     return await decrypt(value.slice(ENCRYPTION_PREFIX.length), key)
   } catch (e) {
-    console.warn(
-      "[DB] Failed to decrypt a sealed secret (wrong JWT_SECRET?):",
+    sealedButUndecryptable++
+    // 保留原值（绝不丢数据），但必须 loudly 报错：这是「密钥与加密时不
+    // 一致」的确凿信号，静默 warn 会让故障以完全无关的形式暴露在下游。
+    console.error(
+      "[DB] Failed to decrypt a sealed value — the encryption key does NOT " +
+        "match the one used when it was written. " +
+        "Check that JWT_SECRET is unchanged (or that the persisted key " +
+        "openlist_encryption_secret was not lost/rotated). " +
+        "Leaving the ciphertext in place so no data is lost. Error:",
       e,
     )
     return value // keep raw value, never lose data
@@ -1486,6 +1576,27 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
       u.password = await unsealValue(u.password, key)
     }
   }
+}
+
+/**
+ * 数据里是否还残留「未解密的密文」。
+ *
+ * 用于在 load 之后自检：只要还有 `enc:v1:` 前缀，就说明 unseal 没生效
+ * （要么取不到密钥，要么密钥不对）。此时若把数据交出去，驱动会直接炸在
+ * `JSON.parse` 上，报错与真实原因毫无关系。
+ */
+function hasSealedValues(data: any): boolean {
+  if (!data) return false
+  for (const s of data.storages || []) {
+    if (isSealedValue(s?.addition)) return true
+  }
+  for (const st of data.settings || []) {
+    if (isSealedValue(st?.value)) return true
+  }
+  for (const u of data.users || []) {
+    if (isSealedValue(u?.password) || isSealedValue(u?.otp_secret)) return true
+  }
+  return false
 }
 
 export const saveDb = async (
@@ -1680,6 +1791,14 @@ export async function resolvePath(virtualPath: string, envCtx?: any) {
       }
 
       let addition: any = {}
+      if (isSealedValue(storage.addition)) {
+        // 与 parseAddition 同理：这里若静默降级成 {}，root_folder_path 会退回
+        // 默认值，故障表现为「目录不对」而不是「密钥不对」，无从下手。
+        console.error(
+          "[DB] resolvePath: storage addition is still encrypted (enc:v1:); " +
+            "root folder falls back to default. Restore the original JWT_SECRET.",
+        )
+      }
       try {
         addition =
           typeof storage.addition === "string"
