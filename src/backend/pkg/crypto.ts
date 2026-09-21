@@ -5,6 +5,34 @@
  * All functions are async.
  */
 
+// ─── At-rest encryption marker ────────────────────────────────────────────────
+//
+// Sensitive fields (storage `addition`, user password/OTP, a few settings) are
+// encrypted at the persistence boundary and stored as:
+//
+//     enc:v1:<saltHex>:<ivHex>:<cipherHex>
+//
+// The marker is what makes decryption *detectable*: anything carrying it must
+// be unsealed before use. Two rules follow from that, and both matter:
+//
+//   1. Sealing is idempotent — a value already carrying the marker is left
+//      alone, so a value that failed to unseal is never double-encrypted.
+//   2. Consumers must never treat a marked value as plaintext. A raw
+//      `JSON.parse()` on it fails with the useless
+//      `Unexpected token 'e', "enc:v1:..." is not valid JSON`, which tells the
+//      operator nothing about the real cause (a lost or changed JWT_SECRET).
+//
+// The constant lives here, at the bottom of the dependency graph, so both the
+// persistence layer (model/db.ts) and every driver-facing parser can check for
+// it without importing each other.
+
+export const ENCRYPTION_PREFIX = "enc:v1:"
+
+/** True when `value` is still wrapped in at-rest encryption. */
+export function isSealedValue(value: unknown): boolean {
+  return typeof value === "string" && value.startsWith(ENCRYPTION_PREFIX)
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function hexEncode(buf: ArrayBuffer): string {
