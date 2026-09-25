@@ -35,7 +35,12 @@
   "main": "src/backend/worker.ts",
   "compatibility_date": "2026-08-04",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": false,
+  // 注：当前部署用的 Cloudflare API Token 仅含 Workers 脚本/KV/Secret 权限，
+  // 缺少 DNS 写入权限，无法以 API 绑定自定义域名（openlist.totootao.top）。
+  // 因此先开启 workers.dev 子域名，确保服务立即可访问：
+  //   https://openlist-next.<子域名>.workers.dev
+  // 之后若要换自定义域名，可在 Cloudflare 控制台手动绑定（见交付说明）。
+  "workers_dev": true,
   "preview_urls": false,
 
   "assets": {
